@@ -1,0 +1,11 @@
+# Environment variables
+.env
+
+# Node dependencies
+node_modules/
+
+# Temporary files
+temp/
+
+# Google Cloud credentials
+google-credentials.json
