@@ -9,10 +9,12 @@ const qrcode = require('qrcode');
 const yaml = require('js-yaml');
 const { Parser } = require('json2csv');
 const csv = require('csv-parser');
-const { downloadFile, jsonToHtml, generatePassword } = require('./utils');
+const { downloadFile, jsonToHtml, generatePassword, translateText, convertUnits, checkDeadLinks, checkWebsiteSecurity } = require('./utils');
 const { getGeminiChatResponse } = require('./aiHandler');
+const { askForColorTheme } = require('./menu');
 const { FieldValue } = require('firebase-admin/firestore');
 const Tesseract = require('tesseract.js');
+const puppeteer = require('puppeteer');
 
 function registerMessageHandlers(bot, db, tempDir) {
     bot.on('text', async (msg) => {
@@ -28,7 +30,108 @@ function registerMessageHandlers(bot, db, tempDir) {
         
         const state = userDoc.exists ? userDoc.data() : {};
 
-        if (state.action === 'awaiting_password_options') {
+        if (state.action === 'awaiting_name_for_profile_card') {
+            await userRef.update({
+                name: text,
+                action: 'awaiting_title_for_profile_card'
+            });
+            bot.sendMessage(chatId, `Great. Now, what's your title, role, or a short description?`);
+        } else if (state.action === 'awaiting_title_for_profile_card') {
+            const title = text;
+            await userRef.update({
+                title: title,
+                action: 'awaiting_qr_choice_for_profile_card'
+            });
+
+            const opts = {
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: 'Yes', callback_data: 'profile_card_qr_yes' }, { text: 'No', callback_data: 'profile_card_qr_no' }]
+                    ]
+                }
+            };
+            bot.sendMessage(chatId, "Excellent. Would you like to add a QR code to your card (e.g., linking to your website or LinkedIn)?", opts);
+        } else if (state.action === 'awaiting_qr_url_for_profile_card') {
+            if (!text.startsWith('http')) {
+                bot.sendMessage(chatId, "That doesn't look like a valid URL. Please send a full URL starting with http:// or https://.");
+                return;
+            }
+            await userRef.update({ qrUrl: text, action: 'awaiting_color_choice' });
+            // We need to send a new message to get a message_id to edit for the color theme menu
+            const sentMessage = await bot.sendMessage(chatId, 'URL received. Now, let\'s pick a color...');
+            askForColorTheme(bot, chatId, sentMessage.message_id);
+        } else if (state.action === 'awaiting_temp_text') {
+            await userRef.delete();
+            const parts = text.split('|');
+            const content = parts[0].trim();
+            const expiryMinutes = parts.length > 1 ? parseInt(parts[1].trim(), 10) : 60; // Default to 60 minutes
+
+            if (!content) {
+                bot.sendMessage(chatId, "Please provide some text to store.");
+                return;
+            }
+            if (isNaN(expiryMinutes) || expiryMinutes <= 0) {
+                bot.sendMessage(chatId, "Invalid expiry time. Please provide a positive number of minutes.");
+                return;
+            }
+
+            const tempId = Math.random().toString(36).substring(2, 10); // Simple unique ID
+            const expiryTime = Date.now() + expiryMinutes * 60 * 1000;
+
+            await db.collection('temp_storage').doc(tempId).set({
+                type: 'text',
+                content: content,
+                expiry: expiryTime,
+                chatId: chatId,
+            });
+
+            bot.sendMessage(chatId, `Your text has been stored temporarily! Use \`/gettemp ${tempId}\` to retrieve it. It will expire in ${expiryMinutes} minutes.`);
+        } else if (state.action === 'awaiting_unit_conversion') {
+            await userRef.delete();
+            const conversionResult = convertUnits(text);
+            bot.sendMessage(chatId, conversionResult);
+        } else if (state.action === 'awaiting_hash_algorithm_for_file') {
+            const algorithm = text.trim();
+            const supportedAlgorithms = ['md5', 'sha1', 'sha256', 'sha512'];
+
+            if (!supportedAlgorithms.includes(algorithm)) {
+                bot.sendMessage(chatId, `Unsupported algorithm. Please use one of: ${supportedAlgorithms.join(', ')}.`);
+                return;
+            }
+
+            await userRef.delete();
+            bot.sendMessage(chatId, `Hashing file with ${algorithm}...`);
+
+            try {
+                const fileLink = await bot.getFileLink(state.file_id);
+                const fileBuffer = await downloadFile(fileLink);
+                
+                const crypto = require('crypto');
+                const hash = crypto.createHash(algorithm).update(fileBuffer).digest('hex');
+                bot.sendMessage(chatId, `*${algorithm.toUpperCase()} Hash:*\n\`\`\`\n${hash}\n\`\`\``, { parse_mode: 'Markdown' });
+            } catch (error) {
+                console.error("Error hashing file:", error);
+                bot.sendMessage(chatId, "Sorry, I couldn't hash that file.");
+            }
+        } else if (state.action === 'awaiting_text_for_hashing') {
+            await userRef.delete();
+            const parts = text.split('|');
+            if (parts.length !== 2) {
+                bot.sendMessage(chatId, "Invalid format. Please use `text | algorithm` (e.g., `my text | md5`).");
+                return;
+            }
+            const [textToHash, algorithm] = parts.map(p => p.trim());
+            const supportedAlgorithms = ['md5', 'sha1', 'sha256', 'sha512'];
+
+            if (!supportedAlgorithms.includes(algorithm)) {
+                bot.sendMessage(chatId, `Unsupported algorithm. Please use one of: ${supportedAlgorithms.join(', ')}.`);
+                return;
+            }
+
+            const crypto = require('crypto');
+            const hash = crypto.createHash(algorithm).update(textToHash).digest('hex');
+            bot.sendMessage(chatId, `*${algorithm.toUpperCase()} Hash:*\n\`\`\`\n${hash}\n\`\`\``, { parse_mode: 'Markdown' });
+        } else if (state.action === 'awaiting_password_options') {
             await userRef.delete();
             bot.deleteMessage(chatId, msg.message_id);
 
@@ -178,6 +281,88 @@ function registerMessageHandlers(bot, db, tempDir) {
                     }
                 }
             })();
+        } else if (state.action === 'awaiting_url_for_dead_link_check') {
+            const url = msg.text;
+            await userRef.delete();
+            if (!url.startsWith('http')) {
+                bot.sendMessage(chatId, "Please provide a valid URL starting with http:// or https://.");
+                return;
+            }
+            const checkingMsg = await bot.sendMessage(chatId, `Checking for dead links on ${url}... This might take a while.`);
+
+            const deadLinks = await checkDeadLinks(url, (progress) => {
+                bot.editMessageText(`Checking for dead links on ${url}...\nChecked ${progress.checked}/${progress.total} links. Found ${progress.dead} dead links.`, {
+                    chat_id: chatId,
+                    message_id: checkingMsg.message_id
+                }).catch(e => {}); // Ignore errors if message is not modified
+            });
+
+            let report = `*Dead link report for ${url}:*\n\n`;
+            if (deadLinks.length === 0) {
+                report += 'No dead links found! 🎉';
+            } else {
+                // Check if the only "dead link" is an error from fetching the initial page
+                if (deadLinks.length === 1 && deadLinks[0].error) {
+                    report += `Could not check the page. Reason: ${deadLinks[0].error}`;
+                } else {
+                    report += `Found ${deadLinks.length} dead links:\n`;
+                    deadLinks.forEach(link => {
+                        report += `• \`${link.url}\` (Status: ${link.status})\n`;
+                    });
+                }
+            }
+            bot.editMessageText(report, { chat_id: chatId, message_id: checkingMsg.message_id, parse_mode: 'Markdown', disable_web_page_preview: true });
+        } else if (state.action === 'awaiting_url_for_security_check') {
+            const url = msg.text;
+            await userRef.delete();
+            if (!url.startsWith('http')) {
+                bot.sendMessage(chatId, "Please provide a valid URL starting with http:// or https://.");
+                return;
+            }
+            const checkingMsg = await bot.sendMessage(chatId, `Performing basic security check on ${url}...`);
+
+            const result = await checkWebsiteSecurity(url);
+
+            let reportMessage = `*Basic Security Report for ${url}:*\n\n`;
+
+            if (!result.success) {
+                reportMessage = `Could not perform security check. Reason: ${result.error}`;
+            } else {
+                const report = result.report;
+                reportMessage += report.isHTTPS 
+                    ? '✅ Uses HTTPS\n' 
+                    : '❌ Does not use HTTPS. Data sent to this site is not encrypted.\n';
+
+                if (report.mixedContent.length > 0) {
+                    reportMessage += `\n⚠️ Found ${report.mixedContent.length} instance(s) of mixed content (insecure resources on a secure page):\n`;
+                    report.mixedContent.slice(0, 5).forEach(item => {
+                        reportMessage += `• \`${item.substring(0, 100)}...\`\n`;
+                    });
+                    if (report.mixedContent.length > 5) {
+                        reportMessage += `...and ${report.mixedContent.length - 5} more.\n`;
+                    }
+                } else {
+                     if(report.isHTTPS) {
+                        reportMessage += '✅ No mixed content found.\n';
+                     }
+                }
+
+                if (report.missingHeaders.length > 0) {
+                    reportMessage += `\n⚠️ Missing recommended security headers:\n`;
+                    report.missingHeaders.forEach(header => {
+                        reportMessage += `• \`${header}\`\n`;
+                    });
+                } else {
+                    reportMessage += '\n✅ All recommended security headers are present.\n';
+                }
+            }
+
+            bot.editMessageText(reportMessage, { 
+                chat_id: chatId, 
+                message_id: checkingMsg.message_id, 
+                parse_mode: 'Markdown',
+                disable_web_page_preview: true 
+            });
         } else if (state.action === 'awaiting_url_for_pdf') {
             const url = msg.text;
             await userRef.delete(); 
@@ -627,11 +812,10 @@ function registerMessageHandlers(bot, db, tempDir) {
                     try {
                         const errorResponse = JSON.parse(responseBody);
                         console.error("Gemini API Error:", errorResponse);
-                        let userMessage = `Sorry, an error occurred with the AI service (Status: ${statusCode}).`;
-                        if (errorResponse.error && errorResponse.error.message) {
-                            userMessage += `\nDetails: ${errorResponse.error.message}`;
-                        }
-                        bot.sendMessage(chatId, userMessage);
+                        // FOR TESTING: Display full error
+                        const userMessage = `An error occurred with the AI service (Status: ${statusCode}).\n\n\`\`\`json\n${JSON.stringify(errorResponse, null, 2)}\n\`\`\``;
+                        bot.sendMessage(chatId, userMessage, { parse_mode: 'Markdown' });
+
                         if (statusCode === 400 || statusCode === 403) {
                              bot.sendMessage(chatId, "Your Google AI Studio API key seems to be invalid. I've removed it. Please set it again.");
                              await userRef.update({
@@ -641,7 +825,7 @@ function registerMessageHandlers(bot, db, tempDir) {
                              });
                         }
                     } catch(e) {
-                        bot.sendMessage(chatId, `An unparsable error occurred with the AI service (Status: ${statusCode}).`);
+                        bot.sendMessage(chatId, `An unparsable error occurred with the AI service (Status: ${statusCode}).\n\nRaw body:\n${responseBody}`);
                     }
                 }
             });
@@ -662,7 +846,27 @@ function registerMessageHandlers(bot, db, tempDir) {
         if (!userDoc.exists) return;
         const state = userDoc.data();
 
-        if (state.action === 'awaiting_image_for_pdf') {
+        if (state.action === 'awaiting_photo_for_profile_card') {
+            const photoId = msg.photo[msg.photo.length - 1].file_id;
+            const fileLink = await bot.getFileLink(photoId);
+            const imagePath = path.join(tempDir, `profile_${chatId}_${Date.now()}.jpg`);
+            
+            try {
+                const imageBuffer = await downloadFile(fileLink);
+                fs.writeFileSync(imagePath, imageBuffer);
+
+                await userRef.update({
+                    photoPath: imagePath,
+                    action: 'awaiting_name_for_profile_card'
+                });
+
+                bot.sendMessage(chatId, "Photo received! Now, what name should I put on the card?");
+            } catch (err) {
+                console.error("Error saving profile card photo:", err);
+                bot.sendMessage(chatId, "I'm sorry, I had trouble saving that photo. Please try again.");
+                await userRef.delete();
+            }
+        } else if (state.action === 'awaiting_image_for_pdf') {
             const photoId = msg.photo[msg.photo.length - 1].file_id;
             const fileLink = await bot.getFileLink(photoId);
             const imagePath = path.join(tempDir, `image_${chatId}_${Date.now()}.jpg`);
@@ -785,21 +989,29 @@ function registerMessageHandlers(bot, db, tempDir) {
             const imagePath = path.join(tempDir, `ocr_image_${chatId}_${Date.now()}.jpg`);
             
             try {
-                bot.sendMessage(chatId, "Processing image for OCR... This might take a moment.");
-                const imageBuffer = await downloadFile(fileLink);
-                fs.writeFileSync(imagePath, imageBuffer);
+                const processingMessage = await bot.sendMessage(chatId, "Processing image for OCR... This might take a moment.");
 
                 const result = await Tesseract.recognize(
                     imagePath,
                     'eng', // English language. Could be extended to support other languages.
-                    { logger: m => console.log(m) } // Log progress to console
+                    {
+                        logger: m => {
+                            if (m.status === 'recognizing text') {
+                                const progress = Math.floor(m.progress * 100);
+                                bot.editMessageText(
+                                    `Recognizing text in image... ${progress}%`,
+                                    { chat_id: chatId, message_id: processingMessage.message_id }
+                                ).catch(() => {}); // Ignore errors if message is not modified
+                            }
+                        }
+                    }
                 );
                 const extractedText = result.data.text.trim();
 
                 if (extractedText) {
-                    bot.sendMessage(chatId, `*Extracted Text:*\n\`\`\`\n${extractedText}\n\`\`\``, { parse_mode: 'Markdown' });
+                    bot.editMessageText(`*Extracted Text:*\n\`\`\`\n${extractedText}\n\`\`\``, { chat_id: chatId, message_id: processingMessage.message_id, parse_mode: 'Markdown' });
                 } else {
-                    bot.sendMessage(chatId, "No text found in the image or text is illegible.");
+                    bot.editMessageText("No text found in the image or text is illegible.", { chat_id: chatId, message_id: processingMessage.message_id });
                 }
 
             } catch (err) {
@@ -882,6 +1094,30 @@ function registerMessageHandlers(bot, db, tempDir) {
                 bot.sendMessage(chatId, "Sorry, I couldn't convert that CSV to JSON. Make sure it's a valid CSV file.");
                 console.error("Error converting CSV to JSON:", error);
             }
+        } else if (state.action === 'awaiting_file_for_hashing') {
+            await userRef.set({
+                file_id: msg.document.file_id,
+                action: 'awaiting_hash_algorithm_for_file'
+            }, { merge: true });
+            bot.sendMessage(chatId, "File received. Now, please send the hashing algorithm (e.g., `md5`, `sha1`, `sha256`, `sha512`).");
+        } else if (state.action === 'awaiting_temp_file') {
+            await userRef.delete();
+            const fileId = msg.document.file_id;
+            const fileName = msg.document.file_name;
+            const expiryMinutes = 60; // Default expiry for files
+
+            const tempId = Math.random().toString(36).substring(2, 10);
+            const expiryTime = Date.now() + expiryMinutes * 60 * 1000;
+
+            await db.collection('temp_storage').doc(tempId).set({
+                type: 'file',
+                fileId: fileId,
+                fileName: fileName,
+                expiry: expiryTime,
+                chatId: chatId,
+            });
+
+            bot.sendMessage(chatId, `Your file has been stored temporarily! Use \`/gettemp ${tempId}\` to retrieve it. It will expire in ${expiryMinutes} minutes.`);
         } else {
             // If action is not awaiting_file_for_upload, delete the state if it's not a known action
             if (state.action) {
@@ -1031,6 +1267,149 @@ function registerMessageHandlers(bot, db, tempDir) {
                 bot.sendMessage(chatId, "I'm not sure what to do with this video. Please select an option from the /start menu.");
                 await userRef.delete();
             }
+        }
+    });
+
+    bot.on('text', async (msg) => {
+        const chatId = msg.chat.id;
+        const text = msg.text;
+        const userRef = db.collection('user_states').doc(String(chatId));
+        const userDoc = await userRef.get();
+
+        if (text.startsWith('/')) return;
+        
+        const state = userDoc.exists ? userDoc.data() : {};
+
+        if (state.action === 'awaiting_text_for_translation') {
+            await userRef.delete();
+            const parts = text.split('|');
+            if (parts.length !== 2) {
+                bot.sendMessage(chatId, "Invalid format. Please use `text | language_code` (e.g., `Hello | es`).");
+                return;
+            }
+            const [textToTranslate, targetLang] = parts.map(p => p.trim());
+            
+            bot.sendMessage(chatId, `Translating to ${targetLang}...`);
+            const translatedText = await translateText(textToTranslate, targetLang);
+
+            if (translatedText) {
+                bot.sendMessage(chatId, `*Translated Text:*\n${translatedText}`, { parse_mode: 'Markdown' });
+            } else {
+                bot.sendMessage(chatId, "Sorry, I couldn't translate that text. Please check the language code and try again.");
+            }
+        } else if (state.action === 'awaiting_password_options') {
+            await userRef.delete();
+            bot.deleteMessage(chatId, msg.message_id);
+
+            const args = text.split(' ');
+            const length = parseInt(args[0], 10);
+            const options = args[1] || 'ulns';
+
+            if (isNaN(length) || length <= 0) {
+                bot.sendMessage(chatId, "Invalid length. Please provide a positive number.");
+                return;
+            }
+            
+            if (length > 1024) {
+                bot.sendMessage(chatId, "Password length cannot exceed 1024 characters.");
+                return;
+            }
+
+            const password = generatePassword(length, options);
+
+            if (!password) {
+                bot.sendMessage(chatId, "Invalid options. Please select at least one character type: u, l, n, s.");
+                return;
+            }
+
+            const warningMessage = "⚠️ Here is your generated password. This message will be deleted in 30 seconds for your security. Please copy it and store it in a safe place. The bot will not save it.";
+            
+            bot.sendMessage(chatId, warningMessage).then(() => {
+                bot.sendMessage(chatId, `\`\`\`\n${password}\n\`\`\``, { parse_mode: 'Markdown' })
+                    .then((sentMessage) => {
+                        setTimeout(() => {
+                            bot.deleteMessage(chatId, sentMessage.message_id).catch(err => console.error("Error deleting password message:", err));
+                        }, 30000);
+                    });
+            });
+        } else if (state.action === 'awaiting_frame_count') {
+            const frameCount = parseInt(text, 10);
+            if (isNaN(frameCount) || frameCount <= 0) {
+                bot.sendMessage(chatId, "Please provide a valid number greater than 0.");
+                return;
+            }
+            await userRef.set({ 
+                frameCount: frameCount,
+                action: 'awaiting_video_for_images' 
+            }, { merge: true });
+            bot.sendMessage(chatId, `Okay, I will extract ${frameCount} frames. Please send me the video.`);
+        } else if (state.action === 'awaiting_text_for_pdf') {
+            await userRef.delete();
+            const doc = new PDFDocument();
+            const filePath = path.join(tempDir, `output_${chatId}_${Date.now()}.pdf`);
+            const stream = fs.createWriteStream(filePath);
+
+            doc.pipe(stream);
+            doc.fontSize(12).text(text, { align: 'left' });
+            doc.end();
+
+            stream.on('finish', () => {
+                bot.sendDocument(chatId, filePath).then(() => {
+                    fs.unlinkSync(filePath);
+                    bot.sendMessage(chatId, "Text converted to PDF successfully! Send /start to convert more.");
+                }).catch(error => {
+                    console.error("Error sending document:", error);
+                    bot.sendMessage(chatId, "There was an error sending your PDF.");
+                });
+            });
+        } else if (state.action === 'awaiting_text_for_csv') {
+            await userRef.delete();
+            try {
+                const csvPath = path.join(tempDir, `text_${chatId}_${Date.now()}.csv`);
+                fs.writeFileSync(csvPath, text);
+                bot.sendDocument(chatId, csvPath).then(() => {
+                    fs.unlinkSync(csvPath);
+                    bot.sendMessage(chatId, "Text converted to CSV successfully!");
+                });
+            } catch (error) {
+                bot.sendMessage(chatId, "Sorry, I couldn't convert that text to CSV.");
+                console.error("Error converting text to CSV:", error);
+            }
+        } else if (state.action === 'awaiting_images_for_pdf' && text.toLowerCase() === 'done') {
+            if (!state.images || state.images.length === 0) {
+                bot.sendMessage(chatId, "You haven't sent any images yet. Please send some images first.");
+                return;
+            }
+
+            const doc = new PDFDocument();
+            const pdfPath = path.join(tempDir, `combined_${chatId}_${Date.now()}.pdf`);
+            const stream = fs.createWriteStream(pdfPath);
+            doc.pipe(stream);
+
+            for (let i = 0; i < state.images.length; i++) {
+                const imagePath = state.images[i];
+                const image = await Jimp.read(imagePath);
+                doc.addPage({ size: [image.bitmap.width, image.bitmap.height] });
+                doc.image(imagePath, 0, 0, {
+                    width: image.bitmap.width,
+                    height: image.bitmap.height
+                });
+            }
+            doc.end();
+
+            stream.on('finish', () => {
+                bot.sendDocument(chatId, pdfPath).then(async () => {
+                    state.images.forEach(imagePath => fs.unlinkSync(imagePath));
+                    fs.unlinkSync(pdfPath);
+                    await userRef.delete();
+                    bot.sendMessage(chatId, "Images combined into PDF successfully! Send /start to convert more.");
+                }).catch(error => {
+                    console.error("Error sending document:", error);
+                    bot.sendMessage(chatId, "There was an error sending your PDF.");
+                });
+            });
+        } else if (state.action === 'awaiting_url_for_screenshot') {
+            // ... [rest of the screenshot code]
         }
     });
 }
